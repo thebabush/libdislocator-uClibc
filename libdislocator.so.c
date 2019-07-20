@@ -148,8 +148,6 @@ static void* __dislocator_alloc(size_t len) {
 
   total_mem += len;
 
-  printf("__dislocator_alloc(%d) = %p:%d\n", len, ret, real_len - 4);
-
   return ret;
 
 }
