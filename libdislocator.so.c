@@ -66,8 +66,16 @@
 #define ALLOC_CANARY  0xAACCAACC
 #define ALLOC_CLOBBER 0xCC
 
-#define PTR_C(_p) (((u32*)(_p))[-1])
-#define PTR_L(_p) (((u32*)(_p))[-2])
+#define PTR_C(_p) (((u32*)(_p))[-2])
+#define PTR_L(_p) (((u32*)(_p))[-1])
+
+// 0b100
+#define HEAP_GRANULARITY 0x04
+
+// see libUc malloc/heap.h
+#define HEAP_ADJUST_SIZE(sz) \
+  (((sz) + HEAP_GRANULARITY - 1) & ~(HEAP_GRANULARITY - 1))
+
 
 /* Configurable stuff (use AFL_LD_* to set): */
 
@@ -103,10 +111,12 @@ static void* __dislocator_alloc(size_t len) {
 
   }
 
+  size_t real_len = HEAP_ADJUST_SIZE(len + 8);
+
   /* We will also store buffer length and a canary below the actual buffer, so
      let's add 8 bytes for that. */
 
-  ret = mmap(NULL, (1 + PG_COUNT(len + 8)) * PAGE_SIZE, PROT_READ | PROT_WRITE,
+  ret = mmap(NULL, (1 + PG_COUNT(real_len)) * PAGE_SIZE, PROT_READ | PROT_WRITE,
              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 
   if (ret == (void*)-1) {
@@ -121,22 +131,24 @@ static void* __dislocator_alloc(size_t len) {
 
   /* Set PROT_NONE on the last page. */
 
-  if (mprotect(ret + PG_COUNT(len + 8) * PAGE_SIZE, PAGE_SIZE, PROT_NONE))
+  if (mprotect(ret + PG_COUNT(real_len) * PAGE_SIZE, PAGE_SIZE, PROT_NONE))
     FATAL("mprotect() failed when allocating memory");
 
   /* Offset the return pointer so that it's right-aligned to the page
      boundary. */
 
-  ret += PAGE_SIZE * PG_COUNT(len + 8) - len - 8;
+  ret += PAGE_SIZE * PG_COUNT(real_len) - real_len;
 
   /* Store allocation metadata. */
 
   ret += 8;
 
-  PTR_L(ret) = len;
+  PTR_L(ret) = real_len - 4;
   PTR_C(ret) = ALLOC_CANARY;
 
   total_mem += len;
+
+  printf("__dislocator_alloc(%d) = %p:%d\n", len, ret, real_len - 4);
 
   return ret;
 
@@ -187,7 +199,8 @@ void* malloc(size_t len) {
 
   DEBUGF("malloc(%zu) = %p [%zu total]", len, ret, total_mem);
 
-  if (ret && len) memset(ret, ALLOC_CLOBBER, len);
+  // TODO: clobber added granularity shit
+  if (ret && len) memset(ret, ALLOC_CLOBBER, PTR_L(ret) - 4);
 
   return ret;
 
@@ -208,7 +221,9 @@ void free(void* ptr) {
 
   if (PTR_C(ptr) != ALLOC_CANARY) FATAL("bad allocator canary on free()");
 
-  len = PTR_L(ptr);
+  len = PTR_L(ptr) - 4;
+  if (len & ~0xFFFFFFFC)
+    FATAL("free(%p) with wrong length!", len);
 
   total_mem -= len;
 
@@ -238,7 +253,7 @@ void* realloc(void* ptr, size_t len) {
 
     if (PTR_C(ptr) != ALLOC_CANARY) FATAL("bad allocator canary on realloc()");
 
-    memcpy(ret, ptr, MIN(len, PTR_L(ptr)));
+    memcpy(ret, ptr, MIN(len, PTR_L(ptr) - 4));
     free(ptr);
 
   }
